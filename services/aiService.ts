@@ -5,77 +5,100 @@ import { Message, ModelProvider, Chat } from '../types';
 const MAX_HISTORY_MESSAGES = 40;
 const MAX_HISTORY_CHARS = 12000;
 
+/**
+ * Подготавливает историю сообщений для разных провайдеров.
+ * Для DeepSeek/OpenAI реализует строгую логику чередования ролей без "костыльных" сообщений.
+ */
 function mapHistory(history: Message[], provider: ModelProvider) {
   if (history.length === 0) return [];
 
+  // 1. Предварительная фильтрация и обрезка
   const chatMessages = history.filter(m => m.sender !== 'system');
   let recent = chatMessages.slice(-MAX_HISTORY_MESSAGES);
   
   let totalChars = 0;
   let finalMessages: Message[] = [];
-  
   for (let i = recent.length - 1; i >= 0; i--) {
     const msg = recent[i];
-    if (totalChars + msg.text.length > MAX_HISTORY_CHARS && finalMessages.length > 0) {
-      break;
-    }
+    if (totalChars + msg.text.length > MAX_HISTORY_CHARS && finalMessages.length > 0) break;
     totalChars += msg.text.length;
     finalMessages.unshift(msg);
   }
 
-  const merged: { role: 'user' | 'assistant' | 'model'; content: string }[] = [];
-  
-  finalMessages.forEach(msg => {
-    let role: 'user' | 'assistant' | 'model';
-    if (provider === 'gemini') {
-      role = msg.sender === 'user' ? 'user' : 'model';
-    } else {
-      role = msg.sender === 'user' ? 'user' : 'assistant';
+  // 2. Базовое маппирование с сохранением авторства через теги
+  const mapped = finalMessages.map(msg => {
+    const authorLabel = msg.authorName || (msg.sender === 'user' ? 'User' : 'Assistant');
+    const role = provider === 'gemini' 
+      ? (msg.sender === 'user' ? 'user' : 'model') 
+      : (msg.sender === 'user' ? 'user' : 'assistant');
+    
+    return {
+      role,
+      content: `--- SOURCE: ${authorLabel.toUpperCase()} ---\n${msg.text.trim()}\n--- END ${authorLabel.toUpperCase()} ---`
+    };
+  });
+
+  // 3. Обработка для DeepSeek и OpenAI (Строгое чередование)
+  if (provider !== 'gemini') {
+    let strictHistory: { role: 'user' | 'assistant'; content: string }[] = [];
+    
+    // Сначала просто склеиваем идущие подряд одинаковые роли
+    mapped.forEach((m) => {
+      const currentRole = m.role as 'user' | 'assistant';
+      if (strictHistory.length > 0 && strictHistory[strictHistory.length - 1].role === currentRole) {
+        strictHistory[strictHistory.length - 1].content += "\n\n" + m.content;
+      } else {
+        strictHistory.push({ role: currentRole, content: m.content });
+      }
+    });
+
+    // ПРАВИЛО 1: Должно начинаться с 'user'
+    if (strictHistory.length > 0 && strictHistory[0].role === 'assistant') {
+      const first = strictHistory.shift()!;
+      strictHistory.unshift({ 
+        role: 'user', 
+        content: `[PREVIOUS CONTEXT]:\n${first.content}` 
+      });
     }
 
-    // ИЗМЕНЕНИЕ: Используем более жесткие визуальные границы для разделения контекста участников
-    const authorLabel = msg.authorName || (msg.sender === 'user' ? 'User' : 'Assistant');
-    const structuredText = `\n--- SOURCE: ${authorLabel.toUpperCase()} ---\n${msg.text.trim()}\n--- END ${authorLabel.toUpperCase()} ---`;
+    // ПРАВИЛО 2: DeepSeek требует, чтобы история ЗАКАНЧИВАЛАСЬ на 'user'.
+    // Если в истории последним ответил другой ИИ (assistant), мы вливаем его ответ 
+    // в предыдущий user-блок как часть контекста, чтобы не плодить "костыльные" сообщения.
+    if (strictHistory.length > 1 && strictHistory[strictHistory.length - 1].role === 'assistant') {
+      const lastAssistantTurn = strictHistory.pop()!;
+      // Вливаем в предыдущий user-блок
+      strictHistory[strictHistory.length - 1].content += `\n\n[FOLLOW-UP RESPONSE]:\n${lastAssistantTurn.content}`;
+    } else if (strictHistory.length === 1 && strictHistory[0].role === 'assistant') {
+        // Если вообще всего одно сообщение и оно от ассистента (подмена роли)
+        const onlyMsg = strictHistory.pop()!;
+        strictHistory.push({ role: 'user', content: `[DIALOGUE CONTEXT]:\n${onlyMsg.content}` });
+    }
 
-    if (merged.length > 0 && merged[merged.length - 1].role === role) {
-      // Если несколько ИИ ответили подряд, они склеиваются, но теперь с четкими границами
-      merged[merged.length - 1].content += `\n${structuredText}`;
+    return strictHistory;
+  }
+
+  // 4. Обработка для Gemini
+  const geminiHistory: any[] = [];
+  mapped.forEach(m => {
+    if (geminiHistory.length > 0 && geminiHistory[geminiHistory.length - 1].role === m.role) {
+      geminiHistory[geminiHistory.length - 1].content += "\n\n" + m.content;
     } else {
-      merged.push({ role, content: structuredText });
+      geminiHistory.push(m);
     }
   });
 
-  // Strict alternation check for OpenAI/DeepSeek to prevent consecutive same-role messages
-  // This is a "paranoid" pass to fix "Invalid consecutive assistant message" errors.
-  if (provider !== 'gemini') {
-      const strictMerged: typeof merged = [];
-      merged.forEach(m => {
-          if (strictMerged.length > 0 && strictMerged[strictMerged.length - 1].role === m.role) {
-              strictMerged[strictMerged.length - 1].content += "\n\n" + m.content;
-          } else {
-              strictMerged.push(m);
-          }
-      });
-      
-      // Ensure the history starts with a user message if the first one is an assistant
-      if (strictMerged.length > 0 && strictMerged[0].role === 'assistant') {
-          strictMerged.unshift({ role: 'user', content: 'Wake up and analyze the dialogue log.' });
-      }
-      return strictMerged;
-  }
-
-  return merged;
+  return geminiHistory;
 }
 
-// Function to strip the protocol tags if the AI regurgitates them
+/**
+ * Очистка ответа от технических тегов протокола SOURCE/END
+ */
 function cleanResponse(text: string): string {
   if (!text) return "";
-  // Regex to remove lines like "--- SOURCE: NAME ---" and "--- END NAME ---"
-  // Handles potential whitespace/hyphens variations
-  let cleaned = text.replace(/^-+\s*SOURCE:.*?-+\s*$/gim, "");
-  cleaned = cleaned.replace(/^-+\s*END.*?-+\s*$/gim, "");
-  // Remove leading/trailing newlines that might be left over
-  return cleaned.trim();
+  return text
+    .replace(/^-+\s*SOURCE:.*?-+\s*$/gim, "")
+    .replace(/^-+\s*END.*?-+\s*$/gim, "")
+    .trim();
 }
 
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
@@ -115,7 +138,6 @@ export async function getAIResponse(
       throw new Error(`Gemini: ${e.message}`);
     }
   } else {
-
     if (!apiKey) throw new Error(`API Key missing for ${provider.toUpperCase()}`);
 
     const normalizedHistory = mapHistory(history, provider);
@@ -126,39 +148,39 @@ export async function getAIResponse(
     const messages = [
         { role: 'system', content: systemPrompt || "You are a helpful assistant." },
         ...normalizedHistory.map((h) => ({
-        role: h.role as string,
-        content: h.content
+          role: h.role as string,
+          content: h.content
         }))
     ];
 
     try {
         const payload: any = {
-        model: modelName,
-        messages: messages,
-        max_tokens: 2048 
+          model: modelName,
+          messages: messages,
+          max_tokens: 2048 
         };
 
         if (modelName !== 'deepseek-reasoner') {
-        payload.temperature = safeTemperature;
+          payload.temperature = safeTemperature;
         }
 
         const res = await fetch(baseUrl, {
-        method: 'POST',
-        headers: {
-            'Content-Type': 'application/json',
-            'Authorization': `Bearer ${apiKey}`
-        },
-        body: JSON.stringify(payload)
+          method: 'POST',
+          headers: {
+              'Content-Type': 'application/json',
+              'Authorization': `Bearer ${apiKey}`
+          },
+          body: JSON.stringify(payload)
         });
 
         const data = await res.json();
         
         if (!res.ok) {
-            const message = data.error?.message || `Error ${res.status}`;
-            // Improve error clarity for Auth failures
             if (res.status === 401) {
-                 throw new Error(`${provider.toUpperCase()}: Authentication Fails. Please check your API Key in Settings.`);
+              throw new Error(`${provider.toUpperCase()}: Authentication Failed. Check API Key.`);
             }
+            
+            const message = data.error?.message || `Error ${res.status}`;
             if (res.status === 429 && retryCount < 1) {
                 await sleep(2000); 
                 return getAIResponse(provider, modelName, systemPrompt, history, apiKey, temperature, retryCount + 1);
@@ -173,7 +195,6 @@ export async function getAIResponse(
     }
   }
 
-  // Clean the output before returning
   return cleanResponse(rawText);
 }
 

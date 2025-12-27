@@ -511,7 +511,6 @@ const ChatWindow: React.FC<Props> = ({
                         key={assistant.id} 
                         onClick={() => {
                           updateChat({ participantIds: [...(chat.participantIds||[]), assistant.id] });
-                          // Optional: Keep open to add more, or close. Let's keep open for bulk add.
                         }}
                         className="flex items-center py-3 border-b border-gray-800 cursor-pointer active:bg-[#2c2c2e] transition-colors -mx-2 px-2 rounded-lg"
                       >
