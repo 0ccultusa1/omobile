@@ -1,0 +1,8 @@
+{
+  "name": "Copy of SmartChat AI 2",
+  "description": "An iOS-style messenger app for chatting with distinct AI assistants across multiple models (Gemini, DeepSeek, OpenAI). Features organized folders and custom assistant roles.",
+  "requestFramePermissions": [
+    "camera",
+    "microphone"
+  ]
+}
